@@ -61,6 +61,8 @@ def upload(url, path):
 def handler(job):
     started = time.time()
     inp = job.get("input") or {}
+    if inp.get("task") == "warmup":          # sent by the website when a user picks a video; just wakes the worker
+        return {"status": "warm"}
     for key in ("video_url", "audio_url"):
         if not inp.get(key):
             return {"error": f"Missing required input: {key}"}
