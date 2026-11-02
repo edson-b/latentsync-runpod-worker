@@ -1,14 +1,14 @@
 """
 LatentSync worker for RunPod serverless  (endpoint 2zunynale35egv).
 
+Models are loaded ONCE when the worker starts (not once per job), so each job
+only pays for the actual lip-sync work.
+
 Contract with the website (voice-clone/process-video.php + cron-check-jobs.php):
   input : video_url, video_format, audio_url, audio_format, max_video_seconds,
           video_upload_url, inference_steps, guidance_scale   (+ task = "lipsync")
   output: {"video_uploaded": true, "gpu_seconds": N, "measured_seconds": N}
           or {"error": "short reason"}   (the site refunds the customer automatically)
-
-The finished video is POSTed to video_upload_url (a one-time signed link on your site).
-The site's cron then finds the file at the name it chose when the job was queued.
 """
 import base64
 import os
@@ -19,15 +19,101 @@ import time
 
 import requests
 import runpod
+import torch
+from omegaconf import OmegaConf
+from diffusers import AutoencoderKL, DDIMScheduler
+from accelerate.utils import set_seed
+from DeepCache import DeepCacheSDHelper
+
+from latentsync.models.unet import UNet3DConditionModel
+from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
+from latentsync.whisper.audio2feature import Audio2Feature
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-UA = {"User-Agent": "marketplace-worker/1.0"}   # some hosts/WAFs reject the default python-requests agent
+os.chdir(APP_DIR)                                # LatentSync uses paths relative to its repo root
+
+UA = {"User-Agent": "marketplace-worker/1.0"}
 VIDEO_EXTS = {"mp4", "mov", "webm"}
 AUDIO_EXTS = {"wav", "mp3", "m4a", "aac", "ogg", "flac"}
 MAX_INLINE_BYTES = 6 * 1024 * 1024               # only used by the legacy base64 fallback
-INFERENCE_TIMEOUT = 840                          # seconds; endpoint execution timeout is 900
+
+UNET_CONFIG = "configs/unet/stage2_512.yaml"
+UNET_CKPT = "checkpoints/latentsync_unet.pt"
+USE_DEEPCACHE = os.environ.get("LS_DEEPCACHE", "1") == "1"   # set LS_DEEPCACHE=0 if quality drops
+SEED = 1247
 
 
+# --------------------------------------------------------------------------
+# Model loading: runs once per worker, at startup
+# --------------------------------------------------------------------------
+def load_pipeline():
+    t0 = time.time()
+    config = OmegaConf.load(UNET_CONFIG)
+
+    is_fp16 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] > 7
+    dtype = torch.float16 if is_fp16 else torch.float32
+
+    scheduler = DDIMScheduler.from_pretrained("configs")
+
+    if config.model.cross_attention_dim == 768:
+        whisper_path = "checkpoints/whisper/small.pt"
+    elif config.model.cross_attention_dim == 384:
+        whisper_path = "checkpoints/whisper/tiny.pt"
+    else:
+        raise NotImplementedError("cross_attention_dim must be 768 or 384")
+
+    audio_encoder = Audio2Feature(
+        model_path=whisper_path,
+        device="cuda",
+        num_frames=config.data.num_frames,
+        audio_feat_length=config.data.audio_feat_length,
+    )
+
+    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse", torch_dtype=dtype)
+    vae.config.scaling_factor = 0.18215
+    vae.config.shift_factor = 0
+
+    unet, _ = UNet3DConditionModel.from_pretrained(
+        OmegaConf.to_container(config.model), UNET_CKPT, device="cpu"
+    )
+    unet = unet.to(dtype=dtype)
+
+    pipeline = LipsyncPipeline(
+        vae=vae, audio_encoder=audio_encoder, unet=unet, scheduler=scheduler
+    ).to("cuda")
+
+    if USE_DEEPCACHE:
+        helper = DeepCacheSDHelper(pipe=pipeline)
+        helper.set_params(cache_interval=3, cache_branch_id=0)
+        helper.enable()
+
+    print(f"Models loaded in {time.time() - t0:.1f}s", flush=True)
+    return pipeline, config, dtype
+
+
+PIPELINE, CONFIG, DTYPE = load_pipeline()
+
+
+def run_lipsync(video, audio, out, work, steps, guidance):
+    set_seed(SEED)
+    PIPELINE(
+        video_path=video,
+        audio_path=audio,
+        video_out_path=out,
+        num_frames=CONFIG.data.num_frames,
+        num_inference_steps=steps,
+        guidance_scale=guidance,
+        weight_dtype=DTYPE,
+        width=CONFIG.data.resolution,
+        height=CONFIG.data.resolution,
+        mask_image_path=CONFIG.data.mask_image_path,
+        temp_dir=os.path.join(work, "tmp"),
+    )
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
 def download(url, path):
     with requests.get(url, headers=UA, stream=True, timeout=(15, 300)) as r:
         r.raise_for_status()
@@ -58,10 +144,13 @@ def upload(url, path):
     r.raise_for_status()
 
 
+# --------------------------------------------------------------------------
+# Job handler
+# --------------------------------------------------------------------------
 def handler(job):
     started = time.time()
     inp = job.get("input") or {}
-    if inp.get("task") == "warmup":          # sent by the website when a user picks a video; just wakes the worker
+    if inp.get("task") == "warmup":          # models are already loaded at startup, so this just confirms readiness
         return {"status": "warm"}
     for key in ("video_url", "audio_url"):
         if not inp.get(key):
@@ -88,22 +177,10 @@ def handler(job):
         if max_sec and measured > max_sec + 1:
             return {"error": f"Video too long ({measured:.0f}s, limit {max_sec:.0f}s)"}
 
-        proc = subprocess.run(
-            [
-                "python", "-m", "scripts.inference",
-                "--unet_config_path", "configs/unet/stage2_512.yaml",
-                "--inference_ckpt_path", "checkpoints/latentsync_unet.pt",
-                "--inference_steps", str(int(inp.get("inference_steps") or 20)),
-                "--guidance_scale", str(float(inp.get("guidance_scale") or 1.5)),
-                "--video_path", video,
-                "--audio_path", audio,
-                "--video_out_path", out,
-            ],
-            cwd=APP_DIR, capture_output=True, text=True, timeout=INFERENCE_TIMEOUT,
-        )
-        if proc.returncode != 0:
-            print("LatentSync stderr tail:", (proc.stderr or "")[-1500:], flush=True)
-            return {"error": "LatentSync failed: " + ((proc.stderr or "").strip().splitlines() or ["no output"])[-1][:200]}
+        steps = int(inp.get("inference_steps") or 20)
+        guidance = float(inp.get("guidance_scale") or 1.5)
+
+        run_lipsync(video, audio, out, work, steps, guidance)
 
         if not os.path.exists(out) or os.path.getsize(out) < 1000:
             return {"error": "LatentSync produced no video"}
@@ -117,7 +194,6 @@ def handler(job):
             result["video_uploaded"] = True
             return result
 
-        # No upload link supplied: small results can still be returned inline
         size = os.path.getsize(out)
         if size > MAX_INLINE_BYTES:
             return {"error": "No video_upload_url and result too large to return inline"}
@@ -125,12 +201,15 @@ def handler(job):
             result["video_b64"] = base64.b64encode(f.read()).decode()
         return result
 
-    except subprocess.TimeoutExpired:
-        return {"error": "LatentSync timed out"}
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        return {"error": "GPU out of memory (video too large)"}
     except Exception as e:
+        print("Job failed:", repr(e), flush=True)
         return {"error": str(e)[:300]}
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        torch.cuda.empty_cache()
 
 
 runpod.serverless.start({"handler": handler})
